@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站消息与评论本地折叠原型
 // @namespace    local.bili.message.filter
-// @version      0.4.0
-// @description  可逆地折叠自选评论，不调用 B站互动接口
+// @version      0.5.0
+// @description  自动、可逆地折叠符合本地规则的评论，不调用 B站互动接口
 // @match        https://bilibili.com/*
 // @match        https://*.bilibili.com/*
 // @run-at       document-idle
@@ -11,6 +11,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      hdslb.com
+// @license MIT
 // ==/UserScript==
 
 (() => {
@@ -21,6 +22,17 @@
   const LEGACY_SUB_SELECTOR = '.sub-reply-list > .sub-reply-item';
   const OLD_MAIN_SELECTOR = '.comment-list .list-item > .con';
   const OLD_SUB_SELECTOR = '.comment-list .reply-item > .reply-con';
+  // 从用户提供的八张截图左侧头像离线生成，仅保存差异哈希，不包含原图或账号身份。
+  const BUILTIN_AVATAR_SIGNATURES_V1 = [
+    'b8f0ec6cecb294cc:b0f0ccccecb2968c:e6ce8787cf697933',
+    'f0b0e8dc4ce8f8f0:e4b2ecdcccecb8e8:69cc17148ece4c78',
+    '94baf8f6c3c6c6c8:1e38fcf6c3c7c7cc:fcf6e3c711190383',
+    'e0f0cc8c9c8cdcf8:e0d8ac8c9c8c9cd8:146c4d1f2f27141c',
+    'e0f0d88c8c9c9cdc:e0f0d8ae8e9e9c9c:981c464f0f0f2727',
+    'a08ce6e6d49c98f8:a48ce6e6f29e9cf8:4bebc7c33b593d3c',
+    'e4c6868e8eccccc8:c686078e8eccccdc:83834d0f0e33968e',
+    'e4c6868e8ecccccc:c686078e8e94ccd4:83834d0f0f219696',
+  ];
   const KEYS = {
     blockedUids: 'baf.blockedUids.v1',
     blockedNames: 'baf.blockedNames.v1',
@@ -28,6 +40,7 @@
     allowedNames: 'baf.allowedNames.v1',
     heuristicEnabled: 'baf.heuristicEnabled.v1',
     avatarSamples: 'baf.avatarSamples.v1',
+    builtinAvatarEnabled: 'baf.builtinAvatarEnabled.v1',
     shareMentionTarget: 'baf.shareMentionTarget.v1',
   };
   const readSet = key => {
@@ -46,7 +59,7 @@
   };
   const avatarSamples = readSet(KEYS.avatarSamples);
   for (const sample of avatarSamples) {
-    if (!/^[0-9a-f]{16}:[0-9a-f]{16}$/u.test(sample)) avatarSamples.delete(sample);
+    if (!/^[0-9a-f]{16}:[0-9a-f]{16}(?::[0-9a-f]{16})?$/u.test(sample)) avatarSamples.delete(sample);
   }
   const avatarCache = new Map();
   const avatarJobs = new Map();
@@ -58,6 +71,7 @@
   const observedRoots = new WeakSet();
   const shadowObserver = new MutationObserver(scheduleScan);
   let heuristicEnabled = GM_getValue(KEYS.heuristicEnabled, true) !== false;
+  let builtinAvatarEnabled = GM_getValue(KEYS.builtinAvatarEnabled, true) !== false;
   let shareMentionTarget = String(GM_getValue(KEYS.shareMentionTarget, '') || '').trim().replace(/^@/u, '');
   let scanScheduled = false;
 
@@ -77,6 +91,12 @@
   function clearShareMentionTarget() {
     shareMentionTarget = '';
     GM_setValue(KEYS.shareMentionTarget, '');
+    scheduleScan();
+  }
+
+  function disableBuiltinAvatar() {
+    builtinAvatarEnabled = false;
+    GM_setValue(KEYS.builtinAvatarEnabled, false);
     scheduleScan();
   }
 
@@ -148,7 +168,8 @@
       bitmap = await createImageBitmap(image);
       const full = imageHash(bitmap, 0);
       const center = imageHash(bitmap, 0.05);
-      return full && center ? `${full}:${center}` : null;
+      const inner = imageHash(bitmap, 0.20);
+      return full && center && inner ? `${full}:${center}:${inner}` : null;
     } catch {
       return null;
     } finally {
@@ -200,12 +221,29 @@
     return count;
   }
 
-  function matchingAvatarSample(hash) {
+  function matchingAvatarReference(hash, references) {
     if (!hash) return '';
-    const candidates = hash.split(':');
-    for (const sample of avatarSamples) {
-      const reference = sample.split(':');
+    const candidates = hash.split(':').slice(0, 2);
+    for (const sample of references) {
+      const reference = sample.split(':').slice(0, 2);
       if (candidates.some(part => reference.some(item => hashDistance(part, item) <= 6))) return sample;
+    }
+    return '';
+  }
+
+  function matchingAvatarSample(hash) {
+    return matchingAvatarReference(hash, avatarSamples);
+  }
+
+  function builtinAvatarMatchStrength(hash) {
+    if (!hash) return '';
+    const candidate = hash.split(':');
+    for (const reference of BUILTIN_AVATAR_SIGNATURES_V1) {
+      const sample = reference.split(':');
+      if (hashDistance(candidate[0], sample[0]) <= 6 && hashDistance(candidate[1], sample[1]) <= 6) {
+        return 'strong';
+      }
+      if (candidate[2] && hashDistance(candidate[2], sample[2]) <= 4) return 'weak';
     }
     return '';
   }
@@ -239,12 +277,21 @@
         return { kind: 'candidate', reason: '你设置的 @对象开头的视频主评论' };
       }
     }
-    if (info.avatarUrl && avatarSamples.size) {
+    const fishName = /[鱼鲸]/u.test(info.name);
+    if (info.avatarUrl && (avatarSamples.size || builtinAvatarEnabled)) {
       if (!avatarCache.has(info.avatarUrl)) void getAvatarHash(info.avatarUrl);
-      const sample = matchingAvatarSample(avatarCache.get(info.avatarUrl));
+      const hash = avatarCache.get(info.avatarUrl);
+      const sample = matchingAvatarSample(hash);
       if (sample) return { kind: 'candidate', reason: '头像与本地样本相似' };
+      if (builtinAvatarEnabled) {
+        const strength = builtinAvatarMatchStrength(hash);
+        if (strength === 'strong') return { kind: 'candidate', reason: '头像与内置头像高相似' };
+        if (strength === 'weak' && fishName) {
+          return { kind: 'candidate', reason: '鱼／鲸昵称且头像中心与内置头像相似' };
+        }
+      }
     }
-    if (/[鱼鲸]/u.test(info.name) && info.text.length >= 35) {
+    if (fishName && info.text.length >= 35) {
       return { kind: 'candidate', reason: '昵称含鱼／鲸，且评论较长' };
     }
     return null;
@@ -303,7 +350,7 @@
         }
         const sample = matchingAvatarSample(hash);
         if (sample) avatarSamples.delete(sample);
-        else avatarSamples.add(hash);
+        else avatarSamples.add(hash.split(':').slice(0, 2).join(':'));
         saveAvatarSamples();
       });
       user.after(control);
@@ -344,7 +391,7 @@
     ensureControls(card, info);
     let state = cardStates.get(card);
     if (!state) {
-      state = { key: '', revealed: false, placeholder: null };
+      state = { key: '', identity: '', revealed: false, placeholder: null };
       cardStates.set(card, state);
     }
     const result = match(info);
@@ -352,21 +399,26 @@
       state.placeholder?.remove();
       state.placeholder = null;
       state.key = '';
+      state.identity = '';
       state.revealed = false;
       card.classList.remove('baf-collapsed');
       return;
     }
     const key = `${result.kind}:${result.reason}`;
-    if (state.key !== key || !state.placeholder?.isConnected) {
+    const identity = info.uid || info.name;
+    if (state.key !== key || state.identity !== identity || !state.placeholder?.isConnected) {
+      const keepRevealed = state.revealed && state.identity === identity
+        && state.key.startsWith(`${result.kind}:`);
       state.placeholder?.remove();
-      state.revealed = false;
+      state.revealed = keepRevealed;
       state.key = key;
+      state.identity = identity;
       const placeholder = document.createElement('div');
       placeholder.className = 'baf-placeholder';
       const description = document.createElement('span');
       description.textContent = `${result.kind === 'blocked' ? '本地屏蔽' : '疑似自动评论'} · ${info.name} · ${result.reason}`;
       placeholder.append(description);
-      placeholder.append(button('展开', 'reveal', () => {
+      placeholder.append(button(state.revealed ? '收起' : '展开', 'reveal', () => {
         state.revealed = !state.revealed;
         card.classList.toggle('baf-collapsed', !state.revealed);
         placeholder.querySelector('[data-baf-action="reveal"]').textContent = state.revealed ? '收起' : '展开';
@@ -390,6 +442,10 @@
             const current = extract(card);
             if (current) removeMatchingAvatarSample(current);
           }));
+        }
+        if (result.reason === '头像与内置头像高相似'
+            || result.reason === '鱼／鲸昵称且头像中心与内置头像相似') {
+          placeholder.append(button('关闭内置头像规则', 'disable-builtin-avatar', disableBuiltinAvatar));
         }
       }
       card.prepend(placeholder);
@@ -488,6 +544,7 @@
     state.placeholder?.remove();
     state.placeholder = null;
     state.key = '';
+    state.identity = '';
     state.revealed = false;
     target.classList.remove('baf-collapsed');
     target.style.display = state.originalDisplay;
@@ -499,7 +556,7 @@
     const { info } = extraction;
     let state = commentStates.get(target);
     if (!state) {
-      state = { key: '', revealed: false, placeholder: null, originalDisplay: target.style.display, extract };
+      state = { key: '', identity: '', revealed: false, placeholder: null, originalDisplay: target.style.display, extract };
       commentStates.set(target, state);
       trackedComments.add(target);
     }
@@ -511,17 +568,21 @@
       return;
     }
     const key = `${result.kind}:${result.reason}:${info.name}`;
-    if (state.key !== key || state.placeholder?.parentNode !== target.parentNode) {
+    const identity = info.uid || info.name;
+    if (state.key !== key || state.identity !== identity || state.placeholder?.parentNode !== target.parentNode) {
+      const keepRevealed = state.revealed && state.identity === identity
+        && state.key.startsWith(`${result.kind}:`);
       state.placeholder?.remove();
-      state.revealed = false;
+      state.revealed = keepRevealed;
       state.key = key;
+      state.identity = identity;
       const placeholder = document.createElement('div');
       placeholder.className = 'baf-placeholder';
       placeholder.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px;border:1px solid #b8c8d8;border-radius:6px;background:#f5f9ff;color:#334;font-size:13px';
       const description = document.createElement('span');
       description.textContent = `${result.kind === 'blocked' ? '本地屏蔽' : '疑似自动评论'} · ${info.name} · ${result.reason}`;
       placeholder.append(description);
-      placeholder.append(button('展开', 'reveal-comment', () => {
+      placeholder.append(button(state.revealed ? '收起' : '展开', 'reveal-comment', () => {
         state.revealed = !state.revealed;
         target.style.display = state.revealed ? state.originalDisplay : 'none';
         target.classList.toggle('baf-collapsed', !state.revealed);
@@ -546,6 +607,10 @@
             const current = state.extract(target);
             if (current) removeMatchingAvatarSample(current.info);
           }));
+        }
+        if (result.reason === '头像与内置头像高相似'
+            || result.reason === '鱼／鲸昵称且头像中心与内置头像相似') {
+          placeholder.append(button('关闭内置头像规则', 'disable-builtin-avatar', disableBuiltinAvatar));
         }
         if (result.reason === '你设置的 @对象开头的视频主评论') {
           placeholder.append(button('关闭此 @对象规则', 'disable-share-target', clearShareMentionTarget));
@@ -604,6 +669,7 @@
         if (state) {
           state.placeholder = null;
           state.key = '';
+          state.identity = '';
           state.revealed = false;
         }
         card.classList.remove('baf-collapsed');
@@ -646,7 +712,7 @@
         alert('头像样本读取失败，请换一张图片重试。');
         return;
       }
-      avatarSamples.add(hash);
+      avatarSamples.add(hash.split(':').slice(0, 2).join(':'));
       saveAvatarSamples();
     });
     document.body.append(avatarInput);
@@ -657,6 +723,11 @@
         scheduleScan();
       });
       GM_registerMenuCommand('导入本地头像样本图片', () => avatarInput.click());
+      GM_registerMenuCommand('切换内置头像自动折叠（默认开启）', () => {
+        builtinAvatarEnabled = !builtinAvatarEnabled;
+        GM_setValue(KEYS.builtinAvatarEnabled, builtinAvatarEnabled);
+        scheduleScan();
+      });
       GM_registerMenuCommand('清空本地头像样本', () => {
         if (!avatarSamples.size || !confirm(`清空 ${avatarSamples.size} 个本地头像样本？`)) return;
         avatarSamples.clear();
